@@ -1,10 +1,16 @@
 #!/usr/bin/env perl
+#original code by slashbeast (https://github.com/slashbeast)
 
-use warnings;
-use strict;
+use warnings; use strict;
 use autodie qw / :all /;
 use LWP::UserAgent;
 use File::Basename qw/ fileparse basename /;
+use HTML::TreeBuilder::XPath -weak;
+use LWP::Simple; 
+use HTTP::Cookies;
+use Data::Dumper;
+use Tie::File;
+use Time::Piece;
 
 chdir ((fileparse(__FILE__))[1]);
 
@@ -26,6 +32,15 @@ sub fetch {
     my ( $url, $save_to ) = @_;
 
     my $ua = LWP::UserAgent->new;
+
+    if ( -e 'ids' ) {
+        my $cookies = HTTP::Cookies->new({});
+        tie my @session_ids, 'Tie::File', 'ids';
+        #i think one is enough but just to be safe we set both
+        if ($session_ids[0]) { $cookies->set_cookie(0, 'soup_session_id', $session_ids[0], '/', "$ARGV[0]", 80, 0, 0, 86400, 0) }
+        if ($session_ids[1]) { $cookies->set_cookie(0, 'soup_session_id', $session_ids[1], '/', 'soup.io', 80, 0, 0, 86400, 0) }
+        $ua->cookie_jar($cookies);
+    }
 
     # Because 403 on images.
     $ua->agent("Mozilla/5.0 (X11; Linux x86_64; rv:51.0) Gecko/20100101 Firefox/51.0");
@@ -76,22 +91,38 @@ sub list_images {
     return keys %unique_images;
 }
 
-sub get_images {
+sub get_data {
     my $post_url = shift;
 
     my $post = fetch $post_url;
-
     my @images = list_images $post;
 
-    for (@images) {
-        my $image = basename $_;
+    my $html = HTML::TreeBuilder::XPath->new_from_content($post);
+    my $date = $html->findnodes('//span[@class="time hidden"]/abbr/@title');
+    $date = Time::Piece->strptime($date, '%b %d %Y %T UTC');
+    my $repostedfrom = $html->findnodes('//div[@class="source"]');
+    my $reactionto = $html->findvalue('//div[@class="toggle"]/a[2]/@href');
+    $reactionto = length $reactionto ? "Reaction to $reactionto" : '';
+    my $description = $html->findvalue('//div[contains(@class, "content")]/div[contains(@class, "description")]');
+    my $source = $html->findnodes('//div[@class="caption"]/a/@href');
+    #this instead of non-destructive substitution because it breaks syntax highlighting in my sublime lol
+    (my $postid = $html->findnodes('//div[@id="first_batch"]/div[1]/@id')) =~ s/\D//g;
+    my $filename = join '_', grep $_, $date->epoch, $postid;
+    my $comment = join ' | ', grep $_, $reactionto, $repostedfrom, $description, $source;
+
+    for (0 .. $#images) {
+        my ($n, $d, $extension) = fileparse($images[$_], qr/\.[^.]*$/);
+        my $image = "$filename\_$_$extension";
         my $target = "archives/$name/$image";
         if ( not -f $target ) {
-            fetch $_, "$target.tmp";
+            fetch $images[$_], "$target.tmp";
             rename "$target.tmp", $target;
         }
-    }    
-}
+        tie my @post_meta, 'Tie::File', "archives/$name/$filename\_$_.txt";
+        $post_meta[0] = $date->epoch == 0 ? $postid : $date;
+        $post_meta[1] = $comment;
+    }
+ }
 
 mkdir 'archives' if not -d 'archives';
 mkdir "archives/$name" if not -d "archives/$name";
@@ -110,13 +141,13 @@ while( $link ) {
         for (@posts) {
             $fm->start and next;
             
-            get_images($_);
+            get_data($_);
 
             $fm->finish;
         }
         $fm->wait_all_children;
     } else {
-        get_images($_) for @posts;
+        get_data($_) for @posts;
     }
 
     if ($page =~ m/SOUP\.Endless\.next_url = .(\/since\/[0-9]+\?mode=own)/) {
